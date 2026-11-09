@@ -1192,6 +1192,9 @@ preference_settings! {
     /// and automatic result opening; retain the previous result/cancel viewing behavior.
     /// GPU sample edits round to powers of two.
     render_legacy_image_defaults: bool = false, PAGE_GRAPHICS => check_id("prefs.render_legacy_image_defaults");
+    /// Restore native software-pool admission without refusing an available-RAM shortage.
+    /// Shared/host software limits and device/allocation checks remain in force.
+    render_legacy_memory_admission: bool = false, PAGE_GRAPHICS => check_id("prefs.render_legacy_memory_admission");
     /// How finely the viewport tessellates curved faces and edges: `coarse`, `normal`, `fine` or
     /// `ultra` (#1287). Only the display plan the viewport draws; never the design or exports.
     display_quality: String = "normal".into(), PAGE_GRAPHICS;
@@ -1960,6 +1963,7 @@ impl Snapshot {
         let update = std::mem::take(&mut app.preferences.update);
         app.preferences = self.prefs;
         sync_surface_analysis(app);
+        crate::render_workspace::apply_memory_policy(app);
         app.preferences.update = update;
         if units_changed {
             default_units_changed(app);
@@ -2240,6 +2244,7 @@ fn defaults(app: &mut SolveApp, page: usize) {
     let units = app.preferences.default_units.clone();
     reset_preferences(&mut app.preferences, page);
     sync_surface_analysis(app);
+    crate::render_workspace::apply_memory_policy(app);
     if app.preferences.default_units != units {
         default_units_changed(app);
     }
@@ -4260,6 +4265,7 @@ fn apply_preferences(app: &mut SolveApp, new: Prefs, p: &serde_json::Value) -> R
     }
     app.preferences = new;
     sync_surface_analysis(app);
+    crate::render_workspace::apply_memory_policy(app);
     apply_file_limits(&app.preferences);
     if units_changed {
         default_units_changed(app);
@@ -8725,6 +8731,43 @@ mod tests {
         assert!(restored.preferences.render_legacy_image_defaults);
         super::defaults(&mut restored, super::PAGE_GRAPHICS);
         assert!(!restored.preferences.render_legacy_image_defaults);
+    }
+
+    #[test]
+    fn render_legacy_memory_admission_applies_to_both_hosts_and_roundtrips() {
+        use serde_json::json;
+        use solidcraft_engine::render::job::{CpuHost, NativeMemoryPolicy};
+        let mut app = crate::SolveApp::new(Default::default(), Default::default());
+        let cpu = app.session.render_job_host().unwrap().clone();
+        let gpu = CpuHost::cooperative();
+        app.render_workspace.path_host = crate::render_workspace::PathHost::Ready(gpu.clone());
+        assert!(!app.preferences.render_legacy_memory_admission);
+        assert_eq!(cpu.native_memory_policy(), NativeMemoryPolicy::AvailableRam);
+        assert_eq!(gpu.native_memory_policy(), NativeMemoryPolicy::AvailableRam);
+        super::control(&mut app, &json!({"open":"Graphics"})).unwrap();
+        assert!(app.prefs_window.open && app.prefs_window.snapshot.is_some());
+        let out = super::set(&mut app, &json!({"render_legacy_memory_admission":true})).unwrap();
+        assert_eq!(out["render_legacy_memory_admission"], true);
+        assert_eq!(cpu.native_memory_policy(), NativeMemoryPolicy::SoftwarePoolOnly);
+        assert_eq!(gpu.native_memory_policy(), NativeMemoryPolicy::SoftwarePoolOnly);
+        assert!(super::set(&mut app, &json!({"render_legacy_memory_admission":"yes"})).is_err());
+        assert!(app.preferences.render_legacy_memory_admission);
+        super::close(&mut app, true);
+        assert!(!app.prefs_window.open && app.prefs_window.snapshot.is_none());
+        assert!(!app.preferences.render_legacy_memory_admission);
+        // Cancel must restore both reused hosts before any frame/backend sync.
+        assert_eq!(cpu.native_memory_policy(), NativeMemoryPolicy::AvailableRam);
+        assert_eq!(gpu.native_memory_policy(), NativeMemoryPolicy::AvailableRam);
+
+        super::set(&mut app, &json!({"render_legacy_memory_admission":true})).unwrap();
+        let mut restored = crate::SolveApp::new(Default::default(), Default::default());
+        restored.load_prefs(&app.prefs());
+        assert!(restored.preferences.render_legacy_memory_admission);
+        let restored_host = restored.session.render_job_host().unwrap().clone();
+        assert_eq!(restored_host.native_memory_policy(), NativeMemoryPolicy::SoftwarePoolOnly);
+        super::defaults(&mut restored, super::PAGE_GRAPHICS);
+        assert!(!restored.preferences.render_legacy_memory_admission);
+        assert_eq!(restored_host.native_memory_policy(), NativeMemoryPolicy::AvailableRam);
     }
 
     #[test]

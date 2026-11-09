@@ -1,6 +1,30 @@
 use super::*;
 use solidcraft_render::job::{CpuHost, JobId};
 
+#[cfg(not(target_arch = "wasm32"))]
+// Validate each live receipt before comparing deterministic accounting. RAM
+// snapshots and other retained leases can change between otherwise equal checks.
+fn preflight_without_memory_observations(mut reply: Value) -> Value {
+    let total = reply["admission"]["estimated_total_bytes"].as_u64().unwrap();
+    let memory = reply["admission"]["host_memory"].as_object_mut().expect("native preflight reports its RAM admission");
+    let required = memory["required_bytes"].as_u64().unwrap();
+    let admitted = memory["admitted_bytes"].as_u64().unwrap();
+    let available = memory["available_bytes"].as_u64().unwrap();
+    let capacity = memory["capacity_bytes"].as_u64().unwrap();
+    assert_eq!(required, total, "native debit includes the complete public admission");
+    assert!(required <= available, "accepted native debit fits its available RAM: {memory:?}");
+    assert_eq!(admitted.checked_add(available), Some(capacity), "native ledger accounts for the entire capacity snapshot");
+    assert!(
+        matches!(memory["source"].as_str(), Some("system_available" | "system_and_cgroup" | "conservative_fallback")),
+        "native receipt identifies its capacity source"
+    );
+    // Keep required_bytes and every non-observation field in the exact comparison.
+    for field in ["admitted_bytes", "available_bytes", "capacity_bytes", "source"] {
+        memory.remove(field).unwrap();
+    }
+    reply
+}
+
 fn session() -> (Session, CpuHost) {
     let host = CpuHost::cooperative();
     let mut s = Session::default();
@@ -128,7 +152,7 @@ fn saved_gpu_job_routes_before_dispatch_and_reaches_preflight_and_start_without_
     let before = (s.revision, s.evaluations, s.undo.len(), s.redo.len(), s.is_dirty());
     let checked = s.execute("render.preflight", &named).unwrap();
     let inline = s.execute("render.preflight", &json!({"settings":saved})).unwrap();
-    assert_eq!(checked, inline);
+    assert_eq!(preflight_without_memory_observations(checked.clone()), preflight_without_memory_observations(inline));
     assert_eq!(checked["resolved"]["executor"], "gpu-path");
     assert_eq!(checked["options"]["exposure_ev"], 1.75);
     assert_eq!(checked["options"]["samples"], 7);
@@ -209,7 +233,10 @@ fn saved_gpu_job_routes_before_dispatch_and_reaches_preflight_and_start_without_
     let doc = s.doc.clone();
     let before = (s.revision, s.undo.len(), s.redo.len(), s.is_dirty());
     let checked = s.execute("render.preflight", &json!({"setup":"HDR"})).unwrap();
-    assert_eq!(checked, s.execute("render.preflight", &json!({"settings":captured["setup"]})).unwrap());
+    assert_eq!(
+        preflight_without_memory_observations(checked.clone()),
+        preflight_without_memory_observations(s.execute("render.preflight", &json!({"settings":captured["setup"]})).unwrap())
+    );
     assert_eq!(checked["environment"]["source_sha256"], info["sha256"]);
     assert_eq!(checked["environment"]["kind"], "radiance_hdr");
     assert_eq!(checked["environment"]["color_policy"], "declared_linear_srgb_d65");
@@ -253,7 +280,10 @@ fn saved_cpu_job_reopens_and_supplies_exact_options_and_one_exposure_to_check_an
     let before = (s.revision, s.evaluations, s.undo.len(), s.redo.len(), s.is_dirty());
     let named = json!({"setup":"CPU"});
     let checked = s.execute("render.preflight", &named).unwrap();
-    assert_eq!(checked, s.execute("render.preflight", &json!({"settings":saved})).unwrap());
+    assert_eq!(
+        preflight_without_memory_observations(checked.clone()),
+        preflight_without_memory_observations(s.execute("render.preflight", &json!({"settings":saved})).unwrap())
+    );
     assert_eq!(checked["resolved"]["executor"], "cpu-raytrace");
     assert_eq!(checked["request"]["integrator"], "raytrace");
     assert_eq!(checked["request"]["raytrace"]["exposure_ev"], 1.25);
@@ -300,7 +330,10 @@ fn saved_cpu_hdr_reopens_without_source_and_drives_identical_check_start_and_rea
     let doc = s.doc.clone();
     let before = (s.revision, s.undo.len(), s.redo.len(), s.is_dirty());
     let checked = s.execute("render.preflight", &json!({"setup":"HDR"})).unwrap();
-    assert_eq!(checked, s.execute("render.preflight", &json!({"settings":captured["setup"]})).unwrap());
+    assert_eq!(
+        preflight_without_memory_observations(checked.clone()),
+        preflight_without_memory_observations(s.execute("render.preflight", &json!({"settings":captured["setup"]})).unwrap())
+    );
     assert_eq!(checked["request"]["raytrace"]["exposure_ev"], 1.25);
     assert_eq!(checked["environment"]["samples"], 64);
     assert_eq!(checked["environment"]["rotation_radians"], 0.75);
@@ -308,7 +341,10 @@ fn saved_cpu_hdr_reopens_without_source_and_drives_identical_check_start_and_rea
     let runtime = json!({"integrator":"raytrace","settings":{"width":9,"height":9,"background":[13,27,41]},
         "raytrace":{"lights":[],"shadows":false,"primary_samples":4,"exposure_ev":1.25},
         "environment":{"resource":info["sha256"],"rotation_radians":0.75,"intensity":2,"samples":64}});
-    assert_eq!(checked, s.execute("render.preflight", &runtime).unwrap());
+    assert_eq!(
+        preflight_without_memory_observations(checked.clone()),
+        preflight_without_memory_observations(s.execute("render.preflight", &runtime).unwrap())
+    );
     for environment in [
         json!({"resource":"0".repeat(64)}),
         json!({"resource":info["sha256"],"path":"must-not-open.hdr"}),
@@ -425,7 +461,7 @@ fn additional_executor_routes_by_capability_and_survives_document_adoption() {
     session.execute("file.new", &json!({})).unwrap();
     assert_eq!(session.execute("render.preflight", &request).unwrap()["resolved"]["executor"], "test-progressive");
     assert!(session.execute("render.status", &json!({"job":id})).is_err());
-    for bad in [json!({"samples":0}), json!({"max_depth":17}), json!({"seed":-1}), json!({"samples":4097})] {
+    for bad in [json!({"samples":0}), json!({"max_depth":65}), json!({"seed":-1}), json!({"samples":65537})] {
         let mut params = request.clone();
         for (key, value) in bad.as_object().unwrap() {
             params[key] = value.clone();
@@ -1512,7 +1548,9 @@ fn saved_cpu_denoise_reports_its_actual_native_request_and_keeps_regrade_raw() {
     s.execute(
         "render.settings.set",
         &json!({"name":"CPU denoise","set":{"width":8,"height":8,
-        "job":{"method":"cpu_raytrace","options":{"denoise":true,"progressive":{"samples_per_pixel":3,"seed":81},"output":{"linear_exr":true}}}}}),
+        "job":{"method":"cpu_raytrace","options":{"threads":2,"supersampling":2,"denoise":true,
+            "denoise_settings":{"passes":2,"strength":0.5,"firefly_suppression":false,"optical_filter":false},"denoise_diagnostics":true,
+            "progressive":{"samples_per_pixel":3,"seed":81},"output":{"linear_exr":true}}}}}),
     )
     .unwrap();
     s = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
@@ -1524,7 +1562,15 @@ fn saved_cpu_denoise_reports_its_actual_native_request_and_keeps_regrade_raw() {
     assert_eq!(checked["resolved"]["executor"], "cpu-raytrace");
     assert_eq!(checked["request"]["raytrace"]["denoise"], true);
     assert_eq!(checked["denoising"]["backend"], "native_cpu");
-    assert_eq!(checked["denoising"]["passes"], 3);
+    assert_eq!(checked["denoising"]["passes"], 2);
+    assert_eq!(checked["denoising"]["steps"], json!([1, 2]));
+    assert_eq!(checked["denoising"]["settings"], json!({"passes":2,"strength":0.5,"firefly_suppression":false,"optical_filter":false}));
+    assert_eq!(checked["denoising"]["outlier_policy"], "disabled");
+    assert_eq!(checked["denoising"]["optical_policy"], "legacy opaque-only filtering; mirror and glass radiance bypass display filtering");
+    assert_eq!(checked["request"]["raytrace"]["denoise_settings"]["optical_filter"], false);
+    assert_eq!(checked["request"]["raytrace"]["threads"], 2);
+    assert_eq!(checked["request"]["raytrace"]["supersampling"], 2);
+    assert_eq!(checked["request"]["raytrace"]["denoise_diagnostics"], true);
     assert_eq!(checked["denoising"]["raw_linear_accumulator_preserved"], true);
     let started = s.execute("render.start", &json!({"setup":"CPU denoise"})).unwrap();
     let id: JobId = serde_json::from_value(started["job"].clone()).unwrap();
@@ -1534,13 +1580,49 @@ fn saved_cpu_denoise_reports_its_actual_native_request_and_keeps_regrade_raw() {
     assert_eq!(json!(status.request), checked["request"]);
     let frame = handle.frame().unwrap().unwrap();
     let raw = frame.linear_exr().unwrap().to_vec();
+    assert_eq!((frame.info.width, frame.info.height), (8, 8));
+    assert_eq!(image::load_from_memory(frame.png()).unwrap().to_rgba8().dimensions(), (8, 8));
+    let report = status.denoise_diagnostics.unwrap();
+    assert_eq!((report.width, report.height), (16, 16));
+    assert_eq!(report.counts.iter().sum::<u64>(), 256);
+    let mask = frame.denoise_mask_png().unwrap().to_vec();
+    let mask_info = frame.denoise_mask_info().unwrap();
+    assert_eq!((mask_info.width, mask_info.height), (8, 8));
+    assert_eq!(mask_info.bytes, mask.len() as u64);
+    assert_ne!(mask_info.sha256, frame.info.png_sha256);
+    let decoded = image::load_from_memory(&mask).unwrap().to_rgba8();
+    assert_eq!(decoded.dimensions(), (8, 8));
+    assert!(decoded.pixels().all(|pixel| solidcraft_render::job::DenoiseGuideClass::ALL.iter().any(|class| class.color() == pixel.0)));
+    let status_reply = s.execute("render.status", &json!({"job":id})).unwrap();
+    assert_eq!(status_reply["denoise_mask"], json!(mask_info));
+    assert_eq!(status_reply["denoise_diagnostics"], json!(report));
+    let viewed = s.execute("render.result.view", &json!({"view":"denoise_mask"})).unwrap();
+    assert_eq!(viewed, json!({"view":"denoise_mask","job":id}));
+    let path = std::env::temp_dir().join(format!("solidcraft-cpu-guide-mask-{}-{}.png", std::process::id(), id.session));
+    let previous_check = s.param_check;
+    s.param_check = crate::schema::ParamCheck::Strict;
+    let exported = s.execute("render.export", &json!({"job":id,"path":path,"format":"denoise_mask"})).unwrap();
+    s.param_check = previous_check;
+    assert_eq!(std::fs::read(&path).unwrap(), mask);
+    assert_eq!(exported["format"], "denoise_mask");
+    assert_eq!(exported["encoding"], "categorical_srgb");
+    assert_eq!(exported["alpha"], "opaque");
+    assert_eq!(exported["bytes"], mask_info.bytes);
+    assert!(exported.get("param_warnings").is_none());
+    assert_eq!(exported["denoise_mask"], json!(mask_info));
+    assert_eq!(exported["frame"]["png_sha256"], frame.info.png_sha256);
+    std::fs::remove_file(path).unwrap();
     let result = s.execute("render.result.regrade", &json!({"job":id,"presentation":{"exposure_ev":-1.0}})).unwrap();
     let derivative: JobId = serde_json::from_value(result["job"].clone()).unwrap();
     let derivative = s.render_job_handle(derivative).unwrap();
     let finished = derivative.wait_timeout(std::time::Duration::from_secs(30)).unwrap();
     assert_eq!(finished.progress.phase, Phase::Completed);
     assert!(!finished.presentation.as_ref().unwrap().denoise_applied, "regrade never pretends to reconstruct absent geometry guides");
-    assert_eq!(derivative.frame().unwrap().unwrap().linear_exr().unwrap(), raw);
+    let derivative_frame = derivative.frame().unwrap().unwrap();
+    assert_eq!(derivative_frame.linear_exr().unwrap(), raw);
+    assert_eq!(derivative_frame.denoise_mask_png().unwrap(), mask);
+    assert_eq!(json!(derivative_frame.denoise_mask_info()), json!(Some(mask_info)));
+    assert_eq!(finished.denoise_diagnostics, Some(report));
     assert_eq!(frame.linear_exr().unwrap(), raw);
     assert!(Arc::ptr_eq(&document, &s.doc));
     assert_eq!((s.revision, s.evaluations, s.undo.len(), s.redo.len()), before);
@@ -1594,12 +1676,14 @@ fn saved_cpu_optics_match_runtime_capture_pixels_prefixes_cancel_and_accounting(
     let extra_bytes = (extra_slots * std::mem::size_of::<solidcraft_render::job::DielectricOptions>()) as u64;
     assert_eq!(saved["retained_request_bytes"].as_u64().unwrap() + extra_bytes, runtime["retained_request_bytes"].as_u64().unwrap());
     // Two options copies belong to image work; a third belongs to the retained
-    // immutable request. All other admission fields must remain exactly equal.
-    let mut expected_runtime_admission = saved["admission"].clone();
+    // immutable request. All other deterministic admission fields remain exact.
+    let mut expected_runtime_admission = preflight_without_memory_observations(saved.clone())["admission"].clone();
     for (field, copies) in [("preparation_bytes", 2), ("estimated_total_bytes", 3)] {
         expected_runtime_admission[field] = json!(saved["admission"][field].as_u64().unwrap() + copies * extra_bytes);
     }
-    assert_eq!(expected_runtime_admission, runtime["admission"]);
+    expected_runtime_admission["host_memory"]["required_bytes"] =
+        json!(saved["admission"]["host_memory"]["required_bytes"].as_u64().unwrap() + 3 * extra_bytes);
+    assert_eq!(expected_runtime_admission, preflight_without_memory_observations(runtime.clone())["admission"]);
     assert_eq!(saved["refraction"], true);
     let original_mesh = scene.meshes[0].mesh.clone();
     assert!(!scene.has_transmission(), "saved CPU lowering leaves the captured product appearance and physical material unchanged");
@@ -1925,7 +2009,10 @@ fn saved_cpu_aging_cold_reopen_resolves_exact_target_and_changes_real_png_withou
     let before = (s.revision, s.evaluations, s.undo.len(), s.redo.len(), s.is_dirty());
     let checked = s.execute("render.preflight", &json!({"setup":"CPU aging"})).unwrap();
     assert_eq!(checked["request"]["raytrace"]["aging"][0]["target"]["body_name"], name);
-    assert_eq!(checked, s.execute("render.preflight", &json!({"settings":saved})).unwrap());
+    assert_eq!(
+        preflight_without_memory_observations(checked.clone()),
+        preflight_without_memory_observations(s.execute("render.preflight", &json!({"settings":saved})).unwrap())
+    );
     let started = s.execute("render.start", &json!({"setup":"CPU aging"})).unwrap();
     let id: JobId = serde_json::from_value(started["job"].clone()).unwrap();
     let handle = s.render_job_handle(id).unwrap();
@@ -2229,8 +2316,9 @@ fn runtime_checked_hdr_keeps_two_stable_glass_targets_and_exact_cpu_options_with
     raster["environment"]["path"] = json!("must-not-open-raster-stable-glass.hdr");
     assert!(s.execute("render.preflight", &raster).unwrap_err().to_string().contains("stable optics require"));
     let mut over_cap = params.clone();
+    let optical_limit = solidcraft_render::job::MAX_OPTICAL_TARGETS;
     over_cap["settings"]["optics"] = json!(
-        (0..9)
+        (0..=optical_limit)
             .map(|i| {
                 let mut row = params["settings"]["optics"][0].clone();
                 row["target"]["definition"] = json!(format!("Unique unknown optical body {i}"));
@@ -2239,7 +2327,7 @@ fn runtime_checked_hdr_keeps_two_stable_glass_targets_and_exact_cpu_options_with
             .collect::<Vec<_>>()
     );
     over_cap["environment"]["path"] = json!("must-not-open-over-cap-stable-glass.hdr");
-    assert!(s.execute("render.preflight", &over_cap).unwrap_err().to_string().contains("at most eight"));
+    assert!(s.execute("render.preflight", &over_cap).unwrap_err().to_string().contains(&format!("at most {optical_limit}")));
     let mut changed_hdr = params.clone();
     changed_hdr["environment"]["expected_sha256"] = json!("0".repeat(64));
     assert!(s.execute("render.preflight", &changed_hdr).unwrap_err().to_string().contains("changed since selection"));
@@ -2277,7 +2365,7 @@ fn saved_cpu_path_maps_glass_and_targeted_aging_reach_real_preflight_and_render_
     s.execute(
         "render.settings.set",
         &json!({"name":"Mixed","set":{"camera":camera,"width":8,"height":8,"job":{"method":"cpu_raytrace","options":{
-            "progressive":{"samples_per_pixel":3,"seed":9},"path":{"max_depth":4},"lights":[],
+            "texture_filtering":true,"progressive":{"samples_per_pixel":3,"seed":9},"path":{"max_depth":4},"lights":[],
             "environment":{"color":[1,1,1],"intensity":1},"output":{"linear_exr":true},
             "aging":[{"kind":"fading","target":panel["stable_target"],"strength":0.25,"coverage":1.0,"upward_bias":0.0}]
         }}}}),
@@ -2301,6 +2389,8 @@ fn saved_cpu_path_maps_glass_and_targeted_aging_reach_real_preflight_and_render_
     let history = (s.revision, s.evaluations, s.undo.len(), s.redo.len());
     let checked = s.execute("render.preflight", &json!({"setup":"Mixed"})).unwrap();
     assert_eq!(checked["textures"]["bodies"], 1);
+    assert_eq!(checked["textures"]["filtering"], true);
+    assert_eq!(checked["request"]["raytrace"]["texture_filtering"], true);
     assert_eq!(checked["request"]["raytrace"]["path"]["max_depth"], 4);
     assert_eq!(checked["request"]["raytrace"]["dielectrics"][0]["body_name"], "Glass");
     assert_eq!(checked["request"]["raytrace"]["dielectrics"][0]["boundary"], "closed_mesh");
@@ -2470,7 +2560,11 @@ fn saved_coat_cpu_direct_and_path_render_match_independent_normal_incidence_laye
         let mut plain = setup.clone();
         plain.coats = Default::default();
         let plain_check = s.execute("render.preflight", &json!({"settings":plain})).unwrap();
-        assert_eq!(checked["admission"], plain_check["admission"], "coat uses existing inline surface metadata and the same bounded producer stages");
+        assert_eq!(
+            preflight_without_memory_observations(checked.clone())["admission"],
+            preflight_without_memory_observations(plain_check.clone())["admission"],
+            "coat uses existing inline surface metadata and the same bounded producer stages"
+        );
         assert_eq!(checked["retained_request_bytes"], plain_check["retained_request_bytes"]);
         let mut zero = setup;
         let row = zero.coats.iter().next().unwrap().clone();
@@ -3647,4 +3741,67 @@ fn tessellated_cpu_sheet_saved_and_prospective_bindings_certify_and_render_witho
     assert_eq!(s.doc.render.setups["Sheets"], saved);
     assert!(Arc::ptr_eq(&document, &s.doc) && Arc::ptr_eq(&geometry, &s.model.state()));
     assert_eq!(history, (s.revision, s.evaluations, s.undo.len(), s.redo.len(), s.is_dirty()));
+}
+
+#[cfg(all(feature = "raytrace-cpu", not(target_arch = "wasm32")))]
+#[test]
+fn saved_final_cpu_image_preserves_mode_executor_and_authored_quality_through_start() {
+    let mut session = Session::default();
+    let host = CpuHost::for_platform().unwrap();
+    session.set_render_job_host(Some(host)).unwrap();
+    session.execute("solid.box", &json!({"length":2,"width":3,"height":4})).unwrap();
+    session
+        .execute(
+            "render.settings.set",
+            &json!({"name":"Final OPUS reference","set":{
+            "mode":"final","width":2,"height":2,"job":{"method":"cpu_raytrace","options":{
+                "budget":"workstation","path":{"max_depth":64},"progressive":{"samples_per_pixel":3,"seed":81},
+                "lights":[],"environment":{"color":[0.1,0.2,0.3],"intensity":1},"output":{"linear_exr":true}
+            }}}}),
+        )
+        .unwrap();
+    let params = json!({"setup":"Final OPUS reference"});
+    let before = session.doc.clone();
+    let preflight = session.execute("render.preflight", &params).unwrap();
+    assert_eq!(preflight["resolved"]["profile"]["mode"], "final");
+    assert_eq!(preflight["resolved"]["executor"], "cpu-raytrace");
+    let started = session.execute("render.start", &params).unwrap();
+    let id = serde_json::from_value(started["job"].clone()).unwrap();
+    let job = session.render_job_handle(id).unwrap();
+    let status = job.wait_timeout(std::time::Duration::from_secs(30)).unwrap();
+    assert_eq!(status.progress.phase, solidcraft_render::job::Phase::Completed);
+    assert_eq!(status.resolved.profile.mode, solidcraft_render::RenderMode::Final);
+    assert_eq!(status.resolved.executor.as_str(), "cpu-raytrace");
+    let options = status.request.raytrace.unwrap();
+    assert_eq!(options.path.unwrap().max_depth, 64);
+    assert_eq!(options.progressive.unwrap().samples_per_pixel, 3);
+    assert!(job.frame().unwrap().unwrap().linear_master_info().is_some());
+    assert!(Arc::ptr_eq(&before, &session.doc));
+}
+
+#[cfg(all(feature = "raytrace-cpu", not(target_arch = "wasm32")))]
+#[test]
+fn cpu_quality_limits_refuse_before_input_io_and_scene_capture() {
+    let mut s = Session::default();
+    let host = CpuHost::for_platform().unwrap();
+    s.set_render_job_host(Some(host.clone())).unwrap();
+    let document = s.doc.clone();
+    let before = (s.revision, s.evaluations, s.undo.len(), s.redo.len());
+    for (width, height, options) in [
+        (1024, 1024, json!({"supersampling":2,"progressive":{"samples_per_pixel":8}})),
+        (8, 8, json!({"threads":65})),
+        (8, 8, json!({"supersampling":3})),
+        (8, 8, json!({"denoise_settings":{"passes":4}})),
+        (8193, 1, json!({"budget":"workstation","denoise_diagnostics":true})),
+    ] {
+        let request = json!({"integrator":"raytrace","settings":{"width":width,"height":height},
+            "raytrace":options,"environment":{"path":"must-not-open-quality-controls.hdr"}});
+        for command in ["render.preflight", "render.start"] {
+            let error = s.execute(command, &request).unwrap_err().to_string();
+            assert!(!error.contains("must-not-open-quality-controls.hdr"), "quality must refuse before source IO: {error}");
+            assert_eq!(host.admitted_bytes(), 0);
+            assert!(Arc::ptr_eq(&document, &s.doc));
+            assert_eq!(before, (s.revision, s.evaluations, s.undo.len(), s.redo.len()));
+        }
+    }
 }
