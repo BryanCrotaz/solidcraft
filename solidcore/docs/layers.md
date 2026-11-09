@@ -73,6 +73,7 @@ apps               -> solidcore-ops, solidcore-record, solidcore-tess
 - **Apps never depend on `solidcore` directly.** A modelling call goes through `solidcore-ops`. A number an app needs (a distance, an area, a nearest face) is an ops call.
 - **The kernel depends on no other layer.** Record ↔ kernel conversion is `solidcore-convert`'s job, so the kernel never sees the record.
 - **Tess calls the kernel's evaluator.** Its own fast evaluator is allowed only if it is private, display-only, and never reachable from ops or the apps. A display mesh never decides anything a model depends on.
+  - Until RFC 0003 item 1.8: `solidcore_tess::eval`, SolidCraft's plan evaluator that moved in with its mesher (item 1.1), is public, because SolidCraft's `geom` crate still builds its own surface evaluation on it. Item 1.8 moves that evaluation to `solidcore::eval`, and `solidcore_tess::eval` becomes private again.
 
 ## 4. What each rule is enforced by
 
