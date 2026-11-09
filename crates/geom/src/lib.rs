@@ -41,7 +41,24 @@ pub mod section;
 pub mod simplify;
 pub mod spline_space;
 pub mod stderr;
-pub mod tess;
+/// The plan evaluator and the display plan, now in solidcore-tess with the mesher (RFC 0003,
+/// item 1.1), under their old path.
+pub mod tess {
+    pub use solidcore_tess::eval::*;
+    pub use solidcore_tess::{FacePlan, TessPlan};
+
+    /// A plan evaluated into SolidCraft's [`crate::Mesh`].
+    pub trait EvaluateMesh {
+        /// The plan's mesh ([`TessPlan::evaluate`]), as SolidCraft's mesh.
+        fn evaluate_mesh(&self) -> crate::Mesh;
+    }
+
+    impl EvaluateMesh for TessPlan {
+        fn evaluate_mesh(&self) -> crate::Mesh {
+            self.evaluate().0.into()
+        }
+    }
+}
 pub mod title_block;
 pub mod tspline;
 mod unit_vec3;

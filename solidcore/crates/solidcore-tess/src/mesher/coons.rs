@@ -5,7 +5,7 @@
 //! constrained Delaunay path.
 
 use solidcore_record::Vec3;
-use solidcraft_geom::prelude::*;
+use crate::vec::VecExt as _;
 
 /// Smallest turn (radians) of the boundary at a corner, in the tolerance metric.
 const CORNER_TURN: f64 = 0.6;

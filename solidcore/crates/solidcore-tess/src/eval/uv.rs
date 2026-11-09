@@ -10,7 +10,7 @@
 //! whole circle).
 
 use super::EvalSurface;
-use crate::prelude::*;
+use crate::vec::VecExt as _;
 use solidcore_record::Vec3;
 
 /// The parameter box of a surface and its periods.
@@ -367,7 +367,7 @@ pub fn collapsed(speed: [f64; 2], dom: &Domain, reach: f64) -> [bool; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tess::EvalCurve;
+    use crate::eval::EvalCurve;
 
     fn cylinder() -> EvalSurface {
         EvalSurface::Revolved {
